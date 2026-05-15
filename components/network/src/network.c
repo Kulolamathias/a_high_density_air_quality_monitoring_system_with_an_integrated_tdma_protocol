@@ -1,8 +1,8 @@
 /**
- * @file components/network/network.c
+ * @file components/network/src/network.c
  * @brief Implementation of the common network module.
  *
- * @author AI Assistant
+ * @author Matthithyahu
  * @date 2026/05/12
  */
 
@@ -19,7 +19,7 @@
 #include <stdio.h>
 
 /* -------------------------------------------------------------------------
- * Hard‑coded credentials (identical to the smart‑bin project)
+ * Hard‑coded credentials
  * ------------------------------------------------------------------------- */
 #define WIFI_SSID       "Mathias' Sxx U..."
 #define WIFI_PASSWORD   "1234567890223"
@@ -27,9 +27,6 @@
 #define MQTT_USERNAME   "mqtt_user"
 #define MQTT_PASSWORD   "ega12345"
 
-/* -------------------------------------------------------------------------
- * Module tag for logging
- * ------------------------------------------------------------------------- */
 static const char *TAG = "network";
 
 /* -------------------------------------------------------------------------
@@ -38,13 +35,21 @@ static const char *TAG = "network";
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static network_mqtt_data_cb_t    data_cb    = NULL;
 static char                      node_id[16];
+static bool mqtt_connected = false;
 
 /* -------------------------------------------------------------------------
  * Forward declarations
  * ------------------------------------------------------------------------- */
 static void mqtt_event_handler(void *arg, esp_event_base_t base,
                                int32_t event_id, void *event_data);
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t event_id, void *event_data);
+static void ip_got_handler(void *arg, esp_event_base_t base,
+                           int32_t event_id, void *event_data);
 static void wait_for_ip(void);
+
+/* Semaphore for IP wait – static so the callback can access it */
+static SemaphoreHandle_t ip_sem = NULL;
 
 /* ===================================================================== */
 esp_err_t network_start(void)
@@ -74,11 +79,16 @@ esp_err_t network_start(void)
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &mqtt_event_handler, NULL, NULL));
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &mqtt_event_handler, NULL, NULL));
+        IP_EVENT, IP_EVENT_STA_GOT_IP, ip_got_handler, NULL, NULL));
 
-    wifi_config_t wifi_cfg = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASSWORD } };
+    wifi_config_t wifi_cfg = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+        },
+    };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -172,34 +182,39 @@ void network_mqtt_set_data_callback(network_mqtt_data_cb_t cb)
  * Internal helpers
  * ===================================================================== */
 
+/** Wi‑Fi event handler – only used for logging. */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "Wi‑Fi station started, connecting...");
+        esp_wifi_connect();
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi‑Fi disconnected, reconnecting...");
+        esp_wifi_connect();
+    }
+}
+
+/** IP‑got handler – gives the semaphore to unblock wait_for_ip(). */
+static void ip_got_handler(void *arg, esp_event_base_t base,
+                           int32_t event_id, void *event_data)
+{
+    if (ip_sem) {
+        xSemaphoreGive(ip_sem);
+    }
+}
+
 /** Block until the Wi‑Fi station obtains an IP address. */
 static void wait_for_ip(void)
 {
-    /* We reuse the event handler below; it uses a semaphore. */
-    static SemaphoreHandle_t ip_sem = NULL;
     ip_sem = xSemaphoreCreateBinary();
-    if (!ip_sem) return;
-
-    /* Wait inside the event handler; the handler will give the semaphore
-       when IP_EVENT_STA_GOT_IP arrives. We'll use a simple logic:
-       The mqtt_event_handler now also handles WiFi events; we'll integrate
-       the semaphore in the handler. */
-
-    /* Unfortunately we cannot pass additional context via event handler
-       registration without extra static variables. A clean solution is to
-       use a dedicated event handler inside this function. */
-    esp_event_handler_instance_t instance;
-    esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP,
-        [](void *arg, esp_event_base_t base, int32_t id, void *data) {
-            SemaphoreHandle_t *sem = (SemaphoreHandle_t*)arg;
-            xSemaphoreGive(*sem);
-        },
-        &ip_sem, &instance);
-
+    if (!ip_sem) {
+        ESP_LOGE(TAG, "Could not create IP semaphore");
+        return;
+    }
     xSemaphoreTake(ip_sem, pdMS_TO_TICKS(15000));
     vSemaphoreDelete(ip_sem);
-    esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance);
+    ip_sem = NULL;
 }
 
 /**
@@ -210,25 +225,28 @@ static void wait_for_ip(void)
 static void mqtt_event_handler(void *arg, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
-    if (base == MQTT_EVENT) {
-        switch (event_id) {
-        case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "MQTT connected");
-            break;
-        case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "MQTT disconnected");
-            break;
-        case MQTT_EVENT_DATA: {
-            esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-            if (data_cb) {
-                data_cb(event->topic, event->data, event->data_len);
-            }
-            break;
+    switch (event_id) {
+    case MQTT_EVENT_CONNECTED:
+    mqtt_connected = true;
+        ESP_LOGI(TAG, "MQTT connected");
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        mqtt_connected = false;
+        ESP_LOGW(TAG, "MQTT disconnected");
+        break;
+    case MQTT_EVENT_DATA: {
+        esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+        if (data_cb) {
+            data_cb(event->topic, event->data, event->data_len);
         }
-        default:
-            break;
-        }
+        break;
     }
-    /* The IP event is handled inside wait_for_ip() via a dedicated handler,
-       so we do not need to process it here. */
+    default:
+        break;
+    }
+}
+
+bool network_mqtt_is_connected(void)
+{
+    return mqtt_connected;
 }

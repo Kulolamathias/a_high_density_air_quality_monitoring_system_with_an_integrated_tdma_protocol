@@ -7,4 +7,6 @@ idf_component_register(
 
     REQUIRES 
         gas_sensors
+        network
+        esp_timer
 )

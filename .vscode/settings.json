@@ -15,5 +15,5 @@
     "--compile-commands-dir=c:\\engRel\\iot\\fyp\\other's_fyp\\a_high_density_air_quality_monitoring_system_with_an_integrated_tdma_protocol\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM7"
+  "idf.portWin": "COM18"
 }

@@ -9,6 +9,8 @@ idf_component_register(
         esp_netif 
         esp_event 
         mqtt 
-        esp_sntp 
-        esp_mac
+        efuse
+        json
+        # esp_sntp 
+        # esp_mac
 )
